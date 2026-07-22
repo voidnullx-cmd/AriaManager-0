@@ -51,3 +51,5 @@ When inside the live monitor screen (dl watch), press these keys instantly:
 
 Settings are automatically saved locally at ~/.config/aria-mgr/config. You can adjust default save directories,
 max server connections, and split multi-parts either via dl settings or directly editing the config file.
+
+BY. Void(AIPU)
