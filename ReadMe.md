@@ -17,6 +17,7 @@ Clone the repository and run the universal installer with root privileges:
 ```bash
 git clone [https://github.com/voidnullx-cmd/AriaManager-0.git](https://github.com/voidnullx-cmd/AriaManager-0.git)
 cd AriaManager
+chmod +x install.sh
 sudo ./install.sh
 ```
 
