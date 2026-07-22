@@ -15,7 +15,7 @@ This is a barebones aria2 based cli. hoping to improve its ui in the future and 
 Clone the repository and run the universal installer with root privileges:
 
 ```bash
-git clone [https://github.com/voidnullx-cmd/AriaManager.git](https://github.com/voidnullx-cmd/AriaManager.git)
+git clone [https://github.com/voidnullx-cmd/AriaManager-0.git](https://github.com/voidnullx-cmd/AriaManager-0.git)
 cd AriaManager
 sudo ./install.sh
 ```
