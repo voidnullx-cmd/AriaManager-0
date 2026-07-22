@@ -1,0 +1,324 @@
+#!/bin/bash
+
+# =====================================================================
+# Aria2 Interactive & CLI Download Manager (Progress Bar Edition)
+# =====================================================================
+
+CONFIG_DIR="$HOME/.config/aria-mgr"
+CONFIG_FILE="$CONFIG_DIR/config"
+RPC_URL="http://localhost:6800/jsonrpc"
+
+# Ensure dependencies exist
+for cmd in aria2c curl jq awk; do
+    if ! command -v $cmd &>/dev/null; then
+        echo "❌ Error: '$cmd' is not installed. Please install it first."
+        exit 1
+    fi
+done
+
+# Config Defaults
+mkdir -p "$CONFIG_DIR"
+if [ ! -f "$CONFIG_FILE" ]; then
+    cat <<EOF > "$CONFIG_FILE"
+DEFAULT_DIR="$HOME/Downloads"
+MAX_CONN="16"
+SPLIT_PARTS="16"
+EOF
+fi
+
+source "$CONFIG_FILE"
+
+# Start Aria2 Daemon
+start_daemon() {
+    if ! curl -s "$RPC_URL" &>/dev/null; then
+        aria2c --enable-rpc --rpc-listen-all=false --daemon=true >/dev/null 2>&1
+        sleep 1
+    fi
+}
+
+# Helper for JSON-RPC
+rpc_call() {
+    local method="$1"
+    local params="$2"
+    curl -s -X POST "$RPC_URL" \
+        -H "Content-Type: application/json" \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":\"dl\",\"method\":\"$method\",\"params\":$params}"
+}
+
+# Convert Index Number to Aria2 GID Hash
+get_gid_by_index() {
+    local input="$1"
+    if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -lt 1000 ]; then
+        local active=$(rpc_call "aria2.tellActive" "[]")
+        local waiting=$(rpc_call "aria2.tellWaiting" "[0, 50]")
+        local stopped=$(rpc_call "aria2.tellStopped" "[0, 50]")
+        local all_jobs=$(echo "$active" "$waiting" "$stopped" | jq -s '.[0].result + .[1].result + .[2].result')
+        
+        local idx=$((input - 1))
+        local mapped_gid=$(echo "$all_jobs" | jq -r ".[$idx].gid // empty")
+        if [ -n "$mapped_gid" ] && [ "$mapped_gid" != "null" ]; then
+            echo "$mapped_gid"
+            return
+        fi
+    fi
+    echo "$input"
+}
+
+# Format Bytes to Human Readable (KB, MB, GB)
+format_bytes() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" -eq 0 ]; then
+        echo "0 B"
+    elif [ "$bytes" -lt 1024 ]; then
+        echo "${bytes} B"
+    elif [ "$bytes" -lt 1048576 ]; then
+        awk "BEGIN {printf \"%.1f KB\", $bytes/1024}"
+    elif [ "$bytes" -lt 1073741824 ]; then
+        awk "BEGIN {printf \"%.1f MB\", $bytes/1048576}"
+    else
+        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+    fi
+}
+
+# Generate 10-block Progress Bar
+generate_bar() {
+    local pct_int=$1
+    local filled=$(( pct_int / 10 ))
+    [ "$filled" -gt 10 ] && filled=10
+    local empty=$(( 10 - filled ))
+    
+    local bar="["
+    for ((j=0; j<filled; j++)); do bar="${bar}█"; done
+    for ((j=0; j<empty; j++)); do bar="${bar}░"; done
+    bar="${bar}]"
+    echo "$bar"
+}
+
+# Render Clean Table Grid
+render_grid() {
+    start_daemon
+    local active=$(rpc_call "aria2.tellActive" "[]")
+    local waiting=$(rpc_call "aria2.tellWaiting" "[0, 50]")
+    local stopped=$(rpc_call "aria2.tellStopped" "[0, 50]")
+    
+    local all_jobs=$(echo "$active" "$waiting" "$stopped" | jq -s '.[0].result + .[1].result + .[2].result')
+    local count=$(echo "$all_jobs" | jq 'length')
+
+    if [ "$count" -eq 0 ]; then
+        printf " No active, paused, or completed downloads.\033[K\n"
+        printf "\033[J" 
+        return 1
+    fi
+
+    # Table Header (Formatted perfectly)
+    printf " %-4s | %-8s | %-19s | %-20s | %-12s | %s\033[K\n" "#" "STATUS" "PROGRESS" "DOWNLOADED" "SPEED" "FILE"
+    printf -- "----------------------------------------------------------------------------------------------------------\033[K\n"
+
+    local i=1
+    echo "$all_jobs" | jq -c '.[]' | while read -r job; do
+        local status=$(echo "$job" | jq -r '.status')
+        local total=$(echo "$job" | jq -r '.totalLength')
+        local completed=$(echo "$job" | jq -r '.completedLength')
+        local speed_bytes=$(echo "$job" | jq -r '.downloadSpeed')
+        
+        # 1. Size / Downloaded Ratio
+        local size_str="$(format_bytes "$completed") / $(format_bytes "$total")"
+        if [ "$total" -eq 0 ]; then
+            size_str="$(format_bytes "$completed") / Unknown"
+        fi
+
+        # 2. Percentage and Visual Bar
+        local pct="0.0"
+        local pct_int=0
+        if [ "$total" -gt 0 ]; then
+            pct=$(awk "BEGIN {printf \"%.1f\", ($completed/$total)*100}")
+            pct_int=$(awk "BEGIN {printf \"%d\", ($completed/$total)*100}")
+        fi
+        local prog_bar=$(generate_bar "$pct_int")
+        local prog_str="${prog_bar} ${pct}%"
+
+        # 3. Download Speed
+        local speed_str="-"
+        if [ "$status" == "active" ]; then
+            speed_str="$(format_bytes "$speed_bytes")/s"
+        fi
+
+        # 4. Filename
+        local name=$(echo "$job" | jq -r '.files[0].path // empty')
+        if [ -z "$name" ] || [ "$name" == "null" ]; then
+            name=$(echo "$job" | jq -r '.files[0].uris[0].uri // empty')
+        fi
+        name=$(basename "$name")
+
+        # Print the styled row
+        printf " [%-2d] | %-8s | %-19s | %-20s | %-12s | %s\033[K\n" "$i" "$status" "$prog_str" "$size_str" "$speed_str" "${name:0:30}"
+        i=$((i + 1))
+    done
+    
+    # Table Footer
+    printf -- "----------------------------------------------------------------------------------------------------------\033[K\n"
+    printf "\033[J" # Clear rest of terminal below
+}
+
+# Live Progress Monitor Loop
+live_monitor() {
+    start_daemon
+    trap 'tput cnorm; echo ""; return 0' INT TERM
+    tput civis
+
+    clear
+
+    while true; do
+        printf "\033[H"
+        echo "⚡ --- ARIA2 LIVE DOWNLOAD MONITOR --- ⚡"
+        echo ""
+        render_grid
+        echo ""
+        printf "🎮 Actions: [P]ause | [R]esume | [D]elete | [A]dd | [B]ack to Menu\033[K\n"
+        
+        read -t 1 -n 1 -r key
+
+        case "$key" in
+            [pP])
+                tput cnorm; printf "\n\033[K"
+                read -p "⏸ Enter item # to pause: " item_num
+                pause_download "$item_num"; sleep 0.8; clear; tput civis
+                ;;
+            [rR])
+                tput cnorm; printf "\n\033[K"
+                read -p "▶ Enter item # to resume: " item_num
+                resume_download "$item_num"; sleep 0.8; clear; tput civis
+                ;;
+            [dD]|[cC])
+                tput cnorm; printf "\n\033[K"
+                read -p "🗑 Enter item # to delete/cancel: " item_num
+                cancel_download "$item_num"; sleep 0.8; clear; tput civis
+                ;;
+            [aA])
+                tput cnorm; printf "\n\033[K"
+                add_download_prompt; sleep 0.8; clear; tput civis
+                ;;
+            [bB]|[qQ]|[mM])
+                tput cnorm; clear; return 0
+                ;;
+        esac
+    done
+    tput cnorm
+}
+
+# Prompt helper for adding downloads
+add_download_prompt() {
+    start_daemon
+    read -p "🔗 Enter Download URL: " url
+    if [ -z "$url" ]; then echo "❌ URL cannot be empty."; return; fi
+
+    read -p "📁 Save Directory [$DEFAULT_DIR]: " dir
+    dir="${dir:-$DEFAULT_DIR}"
+    dir="${dir/#\~/$HOME}"
+    mkdir -p "$dir"
+
+    local payload="[[\"$url\"], {\"dir\": \"$dir\", \"max-connection-per-server\": \"$MAX_CONN\", \"split\": \"$SPLIT_PARTS\"}]"
+    local res=$(rpc_call "aria2.addUri" "$payload")
+    local gid=$(echo "$res" | jq -r '.result')
+
+    if [ "$gid" != "null" ] && [ -n "$gid" ]; then
+        echo "✔ Download added!"
+    else
+        echo "❌ Failed to add download."
+    fi
+}
+
+# Add & Jump to Monitor
+add_download() {
+    add_download_prompt
+    live_monitor
+}
+
+# Pause Download
+pause_download() {
+    start_daemon
+    local target="$1"
+    if [ -n "$target" ]; then
+        local gid=$(get_gid_by_index "$target")
+        rpc_call "aria2.pause" "[\"$gid\"]" >/dev/null
+        echo "⏸ Paused item [#$target]"
+    fi
+}
+
+# Resume Download
+resume_download() {
+    start_daemon
+    local target="$1"
+    if [ -n "$target" ]; then
+        local gid=$(get_gid_by_index "$target")
+        rpc_call "aria2.unpause" "[\"$gid\"]" >/dev/null
+        echo "▶ Resumed item [#$target]"
+    fi
+}
+
+# Cancel / Remove Download
+cancel_download() {
+    start_daemon
+    local target="$1"
+    if [ -n "$target" ]; then
+        local gid=$(get_gid_by_index "$target")
+        rpc_call "aria2.remove" "[\"$gid\"]" >/dev/null 2>&1 || rpc_call "aria2.removeDownloadResult" "[\"$gid\"]" >/dev/null 2>&1
+        echo "🗑 Removed item [#$target]"
+    fi
+}
+
+# Configure Settings
+configure_settings() {
+    echo ""; echo "⚙️  --- Aria Manager Settings ---"
+    echo "1) Default Folder:           $DEFAULT_DIR"
+    echo "2) Max Connections/Server:   $MAX_CONN"
+    echo "3) File Split Parts:         $SPLIT_PARTS"; echo ""
+
+    read -p "New Default Directory [$DEFAULT_DIR]: " new_dir
+    read -p "New Max Connections (1-16) [$MAX_CONN]: " new_conn
+    read -p "New Split Parts (1-16) [$SPLIT_PARTS]: " new_parts
+
+    cat <<EOF > "$CONFIG_FILE"
+DEFAULT_DIR="${new_dir:-$DEFAULT_DIR}"
+MAX_CONN="${new_conn:-$MAX_CONN}"
+SPLIT_PARTS="${new_parts:-$SPLIT_PARTS}"
+EOF
+    echo "✔ Settings updated successfully!"
+}
+
+# Interactive Main Menu Loop
+interactive_menu() {
+    while true; do
+        printf "\033[2J\033[H"
+        echo "⚡ --- ARIA DOWNLOAD MANAGER --- ⚡"
+        echo "1) Add Download & Open Live Screen"
+        echo "2) Open Live Download Screen"
+        echo "3) Pause Download (by #)"
+        echo "4) Resume Download (by #)"
+        echo "5) Delete / Cancel Download (by #)"
+        echo "6) Settings (Folder, Parts, Connections)"
+        echo "7) Exit"; echo ""
+        read -p "Select option [1-7]: " choice
+        case $choice in
+            1) add_download ;;
+            2) live_monitor ;;
+            3) read -p "Enter # to pause: " num; pause_download "$num" ;;
+            4) read -p "Enter # to resume: " num; resume_download "$num" ;;
+            5) read -p "Enter # to delete: " num; cancel_download "$num" ;;
+            6) configure_settings; source "$CONFIG_FILE"; read -p "Press Enter to return..." ;;
+            7) echo "Bye!"; exit 0 ;;
+            *) echo "Invalid option." ;;
+        esac
+    done
+}
+
+# Command Router
+case "$1" in
+    add) add_download "$2" "$3" ;;
+    list|ls|watch|monitor) live_monitor ;;
+    pause) pause_download "$2" ;;
+    resume) resume_download "$2" ;;
+    cancel|rm) cancel_download "$2" ;;
+    settings|config) configure_settings ;;
+    *) interactive_menu ;;
+esac
